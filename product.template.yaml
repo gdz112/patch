@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Service & Task for Tyk Pump (Data Plane)
+Transform: AWS::LanguageExtensions
+
+Parameters:
+  FriendlyStackName:
+    Type: String
+
+  ECSClusterStack:
+    Type: String
+
+  VpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app/network/VPCId
+
+  Subnet1Id:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app/network/Sub1Id
+
+  Subnet2Id:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app/network/Sub2Id
+
+  Subnet3Id:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app/network/Sub3Id
+
+  ImageURL:
+    Type: String
+
+  TaskCPU:
+    Type: Number
+    Default: 512
+
+  TaskMemory:
+    Type: Number
+    Default: 1024
+
+  GTISECSTaskProductVersion:
+    Type: String
+
+  RedisEndpoint:
+    Type: String
+
+  RedisEnableCluster:
+    Type: String
+    Default: "false"
+
+  RedisSecurityGroupId:
+    Type: String
+
+  PumpLogLevel:
+    Type: String
+    Default: debug
+
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub svc-${FriendlyStackName}-ecstask
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      PermissionsBoundary: !Sub arn:aws:iam::${AWS::AccountId}:policy/core-ServiceRolePermissionsBoundary
+      Policies:
+        - PolicyName: TykPumpPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: arn:aws:ssm:*:*:parameter/tyk/*
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/app/ecscontainer/${FriendlyStackName}
+      RetentionInDays: 7
+
+  SSMTaskDefinition:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /app/ecs/task/${FriendlyStackName}
+      Type: String
+      Tier: Advanced
+      Value:
+        Fn::ToJsonString:
+          family: !Ref FriendlyStackName
+          networkMode: awsvpc
+          requiresCompatibilities: [FARGATE]
+          cpu: !Ref TaskCPU
+          memory: !Ref TaskMemory
+          taskRoleArn: !Ref ECSTaskRole
+          executionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/svc-ECSFargateExecutionRole-${AWS::Region}
+          containerDefinitions:
+            - name: tyk-pump
+              image: !Ref ImageURL
+              essential: true
+              workingDirectory: /opt/tyk-pump
+              portMappings:
+                - containerPort: 8083
+                  protocol: tcp
+              healthCheck:
+                command:
+                  - CMD-SHELL
+                  - python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8083/health', timeout=3)"
+                interval: 10
+                timeout: 5
+                retries: 5
+                startPeriod: 30
+              environment:
+                - name: TYK_PMP_OMITCONFIGFILE
+                  value: "true"
+                - name: TYK_PMP_ANALYTICSSTORAGETYPE
+                  value: redis
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_DATABASE
+                  value: "0"
+                - name: TYK_PMP_DONTPURGEUPTIMEDATA
+                  value: "true"
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_ADDRS
+                  value: !Ref RedisEndpoint
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_ENABLECLUSTER
+                  value: !Ref RedisEnableCluster
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_REDISUSESSL
+                  value: "true"
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_MAXIDLE
+                  value: "2000"
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_MAXACTIVE
+                  value: "4000"
+                - name: TYK_PMP_PURGEDELAY
+                  value: "2"
+                - name: TYK_PMP_LOGLEVEL
+                  value: !Ref PumpLogLevel
+                - name: TYK_PMP_PUMPS_STDOUT_TYPE
+                  value: stdout
+                - name: TYK_PMP_PUMPS_STDOUT_META_LOGFIELDNAME
+                  value: tyk-analytics-record
+                - name: TYK_PMP_PUMPS_STDOUT_META_FORMAT
+                  value: json
+                - name: TYK_PMP_PUMPS_STDOUT_DECODERAWREQUEST
+                  value: "false"
+                - name: TYK_PMP_PUMPS_STDOUT_DECODERAWRESPONSE
+                  value: "false"
+                - name: TYK_PMP_PUMPS_STDOUT_TIMEOUT
+                  value: "10"
+                - name: TYK_PMP_ANALYTICSSTORAGECONFIG_PASSWORD_SSM
+                  value: /tyk/redis/password
+                - name: HTTP_PROXY
+                  value: http://primary-proxy.gslb.intranet.barcapint.com:8080
+                - name: HTTPS_PROXY
+                  value: http://primary-proxy.gslb.intranet.barcapint.com:8080
+                - name: NO_PROXY
+                  value: "localhost,127.0.0.1,169.254.169.254,.amazonaws.com"
+              logConfiguration:
+                logDriver: awslogs
+                options:
+                  awslogs-group: !Sub /ecs/app/ecscontainer/${FriendlyStackName}
+                  awslogs-region: !Ref AWS::Region
+                  awslogs-stream-prefix: tyk-pump
+
+  ECSTask:
+    Type: AWS::ServiceCatalog::CloudFormationProvisionedProduct
+    Properties:
+      ProductName: ecs-task
+      ProvisioningArtifactName: !Ref GTISECSTaskProductVersion
+      ProvisioningParameters:
+        - Key: TaskDefinitionSSM
+          Value: !Ref SSMTaskDefinition
+        - Key: SynchNexusImage
+          Value: "True"
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tyk ECS Pump SG
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 6429
+          ToPort: 6429
+          DestinationSecurityGroupId: !Ref RedisSecurityGroupId
+
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub ${ECSClusterStack}-ClusterName
+      ServiceName: !Sub ${FriendlyStackName}-service
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !GetAtt ECSTask.Outputs.ECSTaskDefinitionArn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref Subnet1Id
+            - !Ref Subnet2Id
+            - !Ref Subnet3Id
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup

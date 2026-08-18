@@ -1,0 +1,39 @@
+StackName: tyk-pump-test
+
+Capabilities:
+  - CAPABILITY_NAMED_IAM
+  - CAPABILITY_AUTO_EXPAND
+
+Parameters:
+  - ParameterKey: FriendlyStackName
+    ParameterValue: tyk-pump-test
+
+  - ParameterKey: GTISECSTaskProductVersion
+    ParameterValue: v6
+
+  - ParameterKey: ECSClusterStack
+    ParameterValue: tyk-cluster
+
+  - ParameterKey: TaskCPU
+    ParameterValue: "512"
+
+  - ParameterKey: TaskMemory
+    ParameterValue: "1024"
+
+  - ParameterKey: ImageURL
+    ParameterValue: "%ImageURL%"
+
+  - ParameterKey: RedisEndpoint
+    ParameterValue: master.tykdevdpredis-elasticache-rg.pwgmjk.euw2.cache.amazonaws.com:6429
+
+  - ParameterKey: RedisEnableCluster
+    ParameterValue: "false"
+
+  - ParameterKey: RedisSecurityGroupId
+    ParameterValue: sg-0364d6d9228c04a57
+
+  - ParameterKey: PumpLogLevel
+    ParameterValue: debug
+
+  - ParameterKey: Environment
+    ParameterValue: dev

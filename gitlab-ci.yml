@@ -1,0 +1,339 @@
+spec:
+  inputs:
+    deploy_gateway:
+      default: "true"
+      options: ["true", "false"]
+      description: "Enable or disable Gateway build and deploy"
+    deploy_pump:
+      default: "false"
+      options: ["true", "false"]
+      description: "Enable or disable Pump build and deploy"
+    gateway_friendly_stack_name:
+      default: "tyk-gateway-test"
+      description: "Gateway CloudFormation stack and ECS service prefix"
+    pump_friendly_stack_name:
+      default: "tyk-pump-test"
+      description: "Pump CloudFormation stack and ECS service prefix"
+    ecs_cluster_stack_name:
+      default: "tyk-cluster"
+      description: "Shared ECS cluster stack name"
+    pump_base_image:
+      default: "container-release.container-registry-non-prod.barcapint.com/barclays/barclays-api-gateway/tyk/tyk-pump/1.16.0:1.16.0.291"
+      description: "Barclays UBI8 Pump image produced by tyk-pump-docker-image"
+    pump_task_cpu:
+      default: "512"
+      description: "Pump Fargate CPU units"
+    pump_task_memory:
+      default: "1024"
+      description: "Pump Fargate memory in MiB"
+    pump_redis_endpoint:
+      default: "master.tykdevdpredis-elasticache-rg.pwgmjk.euw2.cache.amazonaws.com:6429"
+      description: "Redis endpoint for Pump analytics storage"
+    pump_redis_enable_cluster:
+      default: "false"
+      options: ["true", "false"]
+      description: "Set true for prod cluster-mode Redis, false for non-prod master endpoint"
+    pump_redis_security_group_id:
+      default: "sg-0364d6d9228c04a57"
+      description: "ElastiCache security group ID for egress"
+    pump_log_level:
+      default: "debug"
+      description: "Pump runtime log level"
+    enable_observe:
+      default: "false"
+      options: ["true", "false"]
+      description: "Create CloudWatch subscription filters for Observe"
+    observe_kinesis_destination_arn:
+      default: ""
+      description: "Observe Kinesis destination ARN from onboarding confirmation"
+    observe_filter_pattern:
+      default: ""
+      description: "CloudWatch subscription filter pattern; empty means forward all logs"
+
+---
+
+stages:
+  - .pre
+  - publish
+  - dev-deploy
+
+variables:
+  PROJECT_NAME: tyk-gateway
+  NP_SYSTEM_ACCOUNT: sysTykNexusAccessT
+  DOCKER_REGISTRY: container-release.container-registry-non-prod.barcapint.com
+  DOCKER_NAMESPACE: barclays/barclays-api-gateway/tyk/tyk-gateway
+  PUMP_DOCKER_NAMESPACE: barclays/barclays-api-gateway/tyk/tyk-pump
+  DEPLOY_GATEWAY: $[[ inputs.deploy_gateway ]]
+  DEPLOY_PUMP: $[[ inputs.deploy_pump ]]
+  GATEWAY_FRIENDLY_STACK_NAME: $[[ inputs.gateway_friendly_stack_name ]]
+  PUMP_FRIENDLY_STACK_NAME: $[[ inputs.pump_friendly_stack_name ]]
+  ECS_CLUSTER_STACK_NAME: $[[ inputs.ecs_cluster_stack_name ]]
+  PUMP_BASE_IMAGE: $[[ inputs.pump_base_image ]]
+  PUMP_TASK_CPU: $[[ inputs.pump_task_cpu ]]
+  PUMP_TASK_MEMORY: $[[ inputs.pump_task_memory ]]
+  PUMP_REDIS_ENDPOINT: $[[ inputs.pump_redis_endpoint ]]
+  PUMP_REDIS_ENABLE_CLUSTER: $[[ inputs.pump_redis_enable_cluster ]]
+  PUMP_REDIS_SECURITY_GROUP_ID: $[[ inputs.pump_redis_security_group_id ]]
+  PUMP_LOG_LEVEL: $[[ inputs.pump_log_level ]]
+  ENABLE_OBSERVE: $[[ inputs.enable_observe ]]
+  OBSERVE_KINESIS_DESTINATION_ARN: $[[ inputs.observe_kinesis_destination_arn ]]
+  OBSERVE_FILTER_PATTERN: $[[ inputs.observe_filter_pattern ]]
+  NP_ACCOUNT_ADMIN_ROLE_ARN: "arn:aws:iam::787411925047:role/core-AccountAdmin-[unclear]"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - when: always
+
+.develop-or-main-branch: &develop-or-main-branch
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "COOAPIBAGW-3232-new"
+
+.np_blz_account_admin_profile:
+  before_script:
+    - !reference [.csm_aws_credentials, before_script]
+    - !reference [.blz_login_account_admin, before_script]
+  id_tokens: !reference [.csm_aws_credentials, id_tokens]
+
+default:
+  image: $BUILDER_IMAGE_UBI8PLUS
+
+include:
+  - project: barclays/devtooling/images/builder-images
+    file: builder-images.yml
+
+  - component: $CI_SERVER_HOST/barclays/gitlab/components/csm/extract-secrets@release/1.x
+    inputs:
+      anchor_name: .csm_deployment_credentials
+      csm_role: snsvc0054824_gitlab_tyk-nexus-gitlab-access
+      csm_secret_urls:
+        - https://csm-uk1.barcapint.com:8200/v1/CSM/intranet/static-cred/snsvc0054824_systyknexusaccesst
+      csm_auth_url: https://csm-uk1.barcapint.com:8200/v1/CSM/auth/jwt/login
+
+  - component: $CI_SERVER_HOST/barclays/gitlab/components/csm/extract-secrets@release/1.x
+    inputs:
+      anchor_name: .csm_aws_credentials
+      csm_role: snsvc0054824_gitlab_tyk-aws-gitlab-access
+      csm_secret_urls:
+        - https://csm-uk1-stg.barcapint.com:8200/v1/CSM/intranet/static-cred/snsvc0054824_systykawsaccess
+      csm_auth_url: https://csm-uk1-stg.barcapint.com:8200/v1/CSM/auth/jwt/login
+
+  - local: /.gitlab/ci/blz/login.yml
+    inputs:
+      anchor_name: .blz_login_account_admin
+      username: sysTykAwsAccess
+      role_arn: $NP_ACCOUNT_ADMIN_ROLE_ARN
+      region: eu-west-2
+
+version:
+  stage: .pre
+  script:
+    - export CURRENT_TIMESTAMP=$(date -d "${CI_PIPELINE_CREATED_AT}" '+%Y%m%d%H%M%S')
+    - |
+      if [ "$CI_COMMIT_BRANCH" == "main" ]; then
+        echo "RELEASE_VERSION=${CURRENT_TIMESTAMP}" >> build.env
+      else
+        echo "RELEASE_VERSION=${CURRENT_TIMESTAMP}-SNAPSHOT" >> build.env
+      fi
+  artifacts:
+    reports:
+      dotenv: build.env
+
+set-image-url:
+  stage: .pre
+  script:
+    - |
+      if [ "${DEPLOY_GATEWAY}" == "true" ]; then
+        yq -i '(.Parameters[] | select(.ParameterKey == "FriendlyStackName").ParameterValue) |= env(GATEWAY_FRIENDLY_STACK_NAME)' infra/dev/deploy-stack.yaml
+        yq -i '(.StackName) |= env(GATEWAY_FRIENDLY_STACK_NAME)' infra/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "ImageURL").ParameterValue) |= env(DOCKER_REGISTRY) + "/" + env(DOCKER_NAMESPACE) + ":" + env(RELEASE_VERSION)' infra/dev/deploy-stack.yaml
+        echo "Updated Gateway deploy-stack.yaml:"
+        cat infra/dev/deploy-stack.yaml
+      fi
+
+      if [ "${DEPLOY_PUMP}" == "true" ]; then
+        yq -i '(.StackName) |= env(PUMP_FRIENDLY_STACK_NAME)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "FriendlyStackName").ParameterValue) |= env(PUMP_FRIENDLY_STACK_NAME)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "ECSClusterStack").ParameterValue) |= env(ECS_CLUSTER_STACK_NAME)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "TaskCPU").ParameterValue) |= env(PUMP_TASK_CPU)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "TaskMemory").ParameterValue) |= env(PUMP_TASK_MEMORY)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "ImageURL").ParameterValue) |= env(DOCKER_REGISTRY) + "/" + env(PUMP_DOCKER_NAMESPACE) + ":" + env(RELEASE_VERSION)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "RedisEndpoint").ParameterValue) |= env(PUMP_REDIS_ENDPOINT)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "RedisEnableCluster").ParameterValue) |= env(PUMP_REDIS_ENABLE_CLUSTER)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "RedisSecurityGroupId").ParameterValue) |= env(PUMP_REDIS_SECURITY_GROUP_ID)' infra-pump/dev/deploy-stack.yaml
+        yq -i '(.Parameters[] | select(.ParameterKey == "PumpLogLevel").ParameterValue) |= env(PUMP_LOG_LEVEL)' infra-pump/dev/deploy-stack.yaml
+        echo "Updated Pump deploy-stack.yaml:"
+        cat infra-pump/dev/deploy-stack.yaml
+      fi
+  needs:
+    - version
+  artifacts:
+    paths:
+      - infra/dev/deploy-stack.yaml
+      - infra-pump/dev/deploy-stack.yaml
+
+docker-build:
+  stage: publish
+  extends: .csm_deployment_credentials
+  image: $BUILDER_IMAGE_DOCKER_CLI
+  services:
+    - name: $BUILDER_IMAGE_DOCKER_DIND
+      alias: docker
+  script:
+    - echo "Building Tyk Gateway Docker image..."
+    - docker login -u $NP_SYSTEM_ACCOUNT -p ${!NP_SYSTEM_ACCOUNT} $DOCKER_REGISTRY
+    - docker build -t "$DOCKER_REGISTRY/$DOCKER_NAMESPACE:$RELEASE_VERSION" --label org.opencontainers.image.revision="${CI_COMMIT_SHA}" --label org.opencontainers.image.version="${RELEASE_VERSION}" --network=host .
+    - docker push $DOCKER_REGISTRY/$DOCKER_NAMESPACE:$RELEASE_VERSION
+    - echo "✓ Image pushed to $DOCKER_REGISTRY/$DOCKER_NAMESPACE:$RELEASE_VERSION"
+  rules:
+    - if: '$DEPLOY_GATEWAY == "true"'
+
+docker-build-pump:
+  stage: publish
+  extends: .csm_deployment_credentials
+  image: $BUILDER_IMAGE_DOCKER_CLI
+  services:
+    - name: $BUILDER_IMAGE_DOCKER_DIND
+      alias: docker
+  script:
+    - echo "Building Tyk Pump Docker image from Barclays UBI8 base $PUMP_BASE_IMAGE"
+    - docker login -u $NP_SYSTEM_ACCOUNT -p ${!NP_SYSTEM_ACCOUNT} $DOCKER_REGISTRY
+    - docker build -f pump/Dockerfile --build-arg TYK_PUMP_IMAGE="$PUMP_BASE_IMAGE" -t "$DOCKER_REGISTRY/$PUMP_DOCKER_NAMESPACE:$RELEASE_VERSION" --label org.opencontainers.image.revision="${CI_COMMIT_SHA}" --label org.opencontainers.image.version="${RELEASE_VERSION}" --network=host .
+    - docker push $DOCKER_REGISTRY/$PUMP_DOCKER_NAMESPACE:$RELEASE_VERSION
+    - echo "✓ Pump image pushed to $DOCKER_REGISTRY/$PUMP_DOCKER_NAMESPACE:$RELEASE_VERSION"
+  rules:
+    - if: '$DEPLOY_PUMP == "true"'
+
+ecs-deploy-dev-deploy:
+  stage: dev-deploy
+  tags:
+    - aws-eu-west-2/linux/micro
+  image: $BUILDER_IMAGE_UBI8PLUS
+  extends: .np_blz_account_admin_profile
+  timeout: 1 hour
+  allow_failure: false
+  script:
+    - |
+      input_yaml_path="dev/deploy-stack.yaml"
+      cd "infra"
+      stack_name="$(yq '.StackName' ${input_yaml_path})"
+
+      if ! aws cloudformation describe-stacks --stack-name "${stack_name}"; then
+        echo "No existing stack ${stack_name}, a new stack will be created."
+        create_output="$(aws cloudformation create-stack --cli-input-yaml file://${input_yaml_path} --template-body file://product.template.yaml)"
+        stack_arn="$(echo "${create_output}" | yq '.StackId')"
+        aws cloudformation wait stack-create-complete --stack-name "${stack_arn}"
+        echo "Created stack ${stack_name}: ${stack_arn}"
+      else
+        echo "The stack ${stack_name} exists, an attempt will be made to update the existing stack."
+        update_output="$(aws cloudformation update-stack --cli-input-yaml file://${input_yaml_path} --template-body file://product.template.yaml 2>&1)" || update_exit_code=$?
+
+        if [[ "${update_exit_code}" -ne 0 ]]; then
+          if [[ "${update_output}" == *"An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed."* ]]; then
+            echo "The stack ${stack_name} is unchanged, no update performed."
+          else
+            echo "${update_output}"
+            exit "${update_exit_code}"
+          fi
+        else
+          stack_arn="$(echo "${update_output}" | yq '.StackId')"
+          aws cloudformation wait stack-update-complete --stack-name "${stack_arn}"
+          echo "Updated stack ${stack_name}: ${stack_arn}"
+        fi
+      fi
+  rules:
+    - if: '$DEPLOY_GATEWAY == "true"'
+  needs:
+    - job: set-image-url
+      artifacts: true
+    - job: docker-build
+      artifacts: false
+
+ecs-pump-deploy-dev-deploy:
+  stage: dev-deploy
+  tags:
+    - aws-eu-west-2/linux/micro
+  image: $BUILDER_IMAGE_UBI8PLUS
+  extends: .np_blz_account_admin_profile
+  timeout: 1 hour
+  allow_failure: false
+  script:
+    - |
+      input_yaml_path="dev/deploy-stack.yaml"
+      cd "infra-pump"
+      stack_name="$(yq '.StackName' ${input_yaml_path})"
+
+      if ! aws cloudformation describe-stacks --stack-name "${stack_name}"; then
+        echo "No existing stack ${stack_name}, a new stack will be created."
+        create_output="$(aws cloudformation create-stack --cli-input-yaml file://${input_yaml_path} --template-body file://product.template.yaml)"
+        stack_arn="$(echo "${create_output}" | yq '.StackId')"
+        aws cloudformation wait stack-create-complete --stack-name "${stack_arn}"
+        echo "Created stack ${stack_name}: ${stack_arn}"
+      else
+        echo "The stack ${stack_name} exists, an attempt will be made to update the existing stack."
+        update_output="$(aws cloudformation update-stack --cli-input-yaml file://${input_yaml_path} --template-body file://product.template.yaml 2>&1)" || update_exit_code=$?
+
+        if [[ "${update_exit_code}" -ne 0 ]]; then
+          if [[ "${update_output}" == *"An error occurred (ValidationError) when calling the UpdateStack operation: No updates are to be performed."* ]]; then
+            echo "The stack ${stack_name} is unchanged, no update performed."
+          else
+            echo "${update_output}"
+            exit "${update_exit_code}"
+          fi
+        else
+          stack_arn="$(echo "${update_output}" | yq '.StackId')"
+          aws cloudformation wait stack-update-complete --stack-name "${stack_arn}"
+          echo "Updated stack ${stack_name}: ${stack_arn}"
+        fi
+      fi
+  rules:
+    - if: '$DEPLOY_PUMP == "true"'
+  needs:
+    - job: set-image-url
+      artifacts: true
+    - job: docker-build-pump
+      artifacts: false
+
+observe-subscription-filters-dev-deploy:
+  stage: dev-deploy
+  tags:
+    - aws-eu-west-2/linux/micro
+  image: $BUILDER_IMAGE_UBI8PLUS
+  extends: .np_blz_account_admin_profile
+  timeout: 1 hour
+  allow_failure: false
+  script:
+    - |
+      if [ -z "${OBSERVE_KINESIS_DESTINATION_ARN}" ]; then
+        echo "ERROR: Observe_Kinesis_Destination_ARN is required when Enable_Observe=true"
+        exit 1
+      fi
+
+      if [ "${DEPLOY_GATEWAY}" == "true" ]; then
+        GATEWAY_LOG_GROUP="/ecs/app/ecscontainer/${GATEWAY_FRIENDLY_STACK_NAME}"
+        aws logs put-subscription-filter \
+          --log-group-name "${GATEWAY_LOG_GROUP}" \
+          --filter-name "${GATEWAY_FRIENDLY_STACK_NAME}-observe" \
+          --filter-pattern "${OBSERVE_FILTER_PATTERN}" \
+          --destination-arn "${OBSERVE_KINESIS_DESTINATION_ARN}"
+      fi
+
+      if [ "${DEPLOY_PUMP}" == "true" ]; then
+        PUMP_LOG_GROUP="/ecs/app/ecscontainer/${PUMP_FRIENDLY_STACK_NAME}"
+        aws logs put-subscription-filter \
+          --log-group-name "${PUMP_LOG_GROUP}" \
+          --filter-name "${PUMP_FRIENDLY_STACK_NAME}-observe" \
+          --filter-pattern "${OBSERVE_FILTER_PATTERN}" \
+          --destination-arn "${OBSERVE_KINESIS_DESTINATION_ARN}"
+      fi
+  rules:
+    - if: '$ENABLE_OBSERVE == "true"'
+  needs:
+    - job: ecs-deploy-dev-deploy
+      optional: true
+    - job: ecs-pump-deploy-dev-deploy
+      optional: true
